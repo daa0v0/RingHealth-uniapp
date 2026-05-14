@@ -1,0 +1,30 @@
+{
+  "name": "RWBleModule",
+  "id": "RWBleModule",
+  "version": "1.0.0",
+  "description": "RW BLE Android SDK bridge for uni-app",
+  "_dp_type": "nativeplugin",
+  "_dp_nativeplugin": {
+    "android": {
+      "plugins": [
+        {
+          "type": "module",
+          "name": "RWBleModule",
+          "class": "com.starbase.rwble.RWBleModule"
+        }
+      ],
+      "integrateType": "aar",
+      "buildTypes": [
+        "release"
+      ]
+    },
+    "ios": {}
+  },
+  "platforms": {
+    "android": {
+      "package": "com.starbase.rwble",
+      "classpath": "com.starbase.rwble.RWBleModule"
+    },
+    "ios": {}
+  }
+}

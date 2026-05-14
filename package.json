@@ -1,0 +1,11 @@
+{
+  "name": "uniapp-starbase",
+  "version": "1.0.0",
+  "description": "UniApp mobile pages generated from screenshots",
+  "scripts": {
+    "dev:h5": "uni -p h5",
+    "build:h5": "uni build -p h5"
+  },
+  "dependencies": {},
+  "devDependencies": {}
+}
