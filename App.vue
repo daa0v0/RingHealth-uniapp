@@ -5,6 +5,8 @@ export default {
   onLaunch() {
     console.log('Starbase app launch')
     ringSdk.init()
+    const theme = uni.getStorageSync('starbase_theme') || 'light'
+    uni.$emit('theme-change', theme)
   }
 }
 </script>

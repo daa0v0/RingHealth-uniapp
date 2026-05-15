@@ -8,7 +8,7 @@
 
       <view class="tab-item center-item" :class="{ active: active === 'base' }" @tap="switchTo('/pages/base/index')">
         <view class="center-pill">
-          <image class="center-icon" src="/static/images/device/icon_pedestal.webp" mode="aspectFit"></image>
+          <image class="center-icon" src="/static/images/main/nav_device.webp" mode="aspectFit"></image>
         </view>
         <text class="label">基座</text>
       </view>

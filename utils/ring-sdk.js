@@ -1,4 +1,3 @@
-import nativeBridge from './rw-native-bridge.js'
 import {
   parsePacket,
   parseCmdData,
@@ -6,10 +5,30 @@ import {
   commandFindDevice,
   commandSetTimezone,
   commandSetTime,
+  commandGetFirmware,
+  commandGetPower,
+  commandGetMac,
+  commandGetRestingHealth,
+  commandSetUserInfo,
+  commandTimedMonitor,
+  commandSetLedLevel,
+  commandSetVideoHid,
+  commandSetWearHand,
+  commandSetBleName,
   commandStartSingleTest,
   commandStopSingleTest,
+  commandControlPhoto,
+  commandPowerOff,
   commandReadHistory,
   commandDeleteHistory,
+  commandSensorOutput,
+  commandGenericWrite,
+  parseFirmwareValue,
+  parseHistoryItems,
+  parseRealtimeValue,
+  parseRestingHealth,
+  parseMac,
+  parseSensorPacket,
   TEST_TYPES,
   HISTORY_TYPES
 } from './rw-ble-protocol.js'
@@ -83,7 +102,11 @@ const state = {
     bloodSugar: null,
     steps: null,
     sleep: [],
-    syncSummary: null
+    syncSummary: null,
+    histories: {},
+    resting: null,
+    bloodPressure: null,
+    rawSensor: null
   },
   monitoring: {
     hr: false,
@@ -95,19 +118,27 @@ const state = {
     sportPush: false
   },
   deviceInfo: {
-    sdkVersion: 'v2.0.0_20260208',
-    firmwareVersion: 'RW-SY02-1.0.0',
-    uiVersion: 'UI-1.0.0',
+    sdkVersion: 'RW MiniProgram Protocol 20260426',
+    firmwareVersion: '--',
+    uiVersion: '--',
+    model: '--',
+    shape: '--',
+    width: 0,
+    height: 0,
+    mac: '',
     power: 60
   },
   logs: []
 }
 
 const listeners = []
-let mockTimer = null
-let nativeSubscribed = false
 let bleRuntime = null
 let bleNotifyHandlerBound = false
+let commandQueue = Promise.resolve()
+let pendingResolvers = []
+let lastHistoryBlock = null
+let otaRuntime = null
+let logSeq = 0
 
 function clone(data) {
   return JSON.parse(JSON.stringify(data))
@@ -124,7 +155,8 @@ function formatTime(date) {
 }
 
 function log(message, payload) {
-  state.logs.unshift({ time: formatTime(new Date()), message, payload: payload || null })
+  logSeq += 1
+  state.logs.unshift({ id: `${Date.now()}-${logSeq}`, time: formatTime(new Date()), message, payload: payload || null })
   state.logs = state.logs.slice(0, 120)
   emit()
 }
@@ -213,41 +245,17 @@ function upsertDevice(device) {
   emit()
 }
 
-function nextValue(type) {
-  const ranges = {
-    hr: [68, 92],
-    bo: [96, 99],
-    hrv: [28, 76],
-    stress: [15, 60],
-    bloodSugar: [48, 63],
-    steps: [1200, 10500],
-    power: [35, 92]
+function clearRealtimeValue(type) {
+  const map = {
+    hr: 'hr',
+    bo: 'bo',
+    hrv: 'hrv',
+    stress: 'stress',
+    bloodSugar: 'bloodSugar',
+    bloodPressure: 'bloodPressure'
   }
-  const range = ranges[type]
-  return Math.round(range[0] + Math.random() * (range[1] - range[0]))
-}
-
-function updateRealtimeHealth() {
-  if (state.monitoring.hr) state.health.hr = nextValue('hr')
-  if (state.monitoring.bo) state.health.bo = nextValue('bo')
-  if (state.monitoring.hrv) state.health.hrv = nextValue('hrv')
-  if (state.monitoring.stress) state.health.stress = nextValue('stress')
-  if (state.monitoring.bloodSugar) state.health.bloodSugar = (nextValue('bloodSugar') / 10).toFixed(1)
-  if (state.connected) state.health.steps = nextValue('steps')
-}
-
-function startMockHealth() {
-  stopMockHealth()
-  mockTimer = setInterval(() => {
-    if (!state.connected) return
-    updateRealtimeHealth()
-    emit()
-  }, 3000)
-}
-
-function stopMockHealth() {
-  if (mockTimer) clearInterval(mockTimer)
-  mockTimer = null
+  const key = map[type]
+  if (key) state.health[key] = null
 }
 
 function requireConnected() {
@@ -328,6 +336,34 @@ function writePacket(buffer) {
   })
 }
 
+function handleProtocolData(cmdData, parsed) {
+  if (!cmdData) return
+  const realtime = parseRealtimeValue(cmdData.cmdKey, cmdData.value)
+  if (realtime) {
+    if (realtime.type === 'bloodPressure') state.health.bloodPressure = realtime
+    else state.health[realtime.type] = realtime.value
+    emit()
+  }
+  if (cmdData.cmdKey === 0x0281) state.health.resting = parseRestingHealth(cmdData.value)
+  if (cmdData.cmdKey === 0x0205) state.deviceInfo.mac = parseMac(cmdData.value)
+  if (cmdData.cmdKey === 0x0204) {
+    const info = parseFirmwareValue(cmdData.value)
+    if (info) Object.assign(state.deviceInfo, info)
+  }
+  if (cmdData.cmdKey === 0x0203 && cmdData.value.length) state.deviceInfo.power = cmdData.value[0]
+  if (cmdData.cmdKey === 0x02fb) state.health.rawSensor = parseSensorPacket(cmdData.value)
+  if (cmdData.cmd === 0x05 && cmdData.keyFlag === 0x10) lastHistoryBlock = { key: cmdData.key, value: cmdData.value }
+  pendingResolvers = pendingResolvers.filter((item) => {
+    if (item.matcher(cmdData, parsed)) {
+      clearTimeout(item.timer)
+      item.resolve({ cmdData, parsed })
+      return false
+    }
+    return true
+  })
+  emit()
+}
+
 function bindNotifyHandlerOnce() {
   if (bleNotifyHandlerBound) return
   bleNotifyHandlerBound = true
@@ -338,22 +374,44 @@ function bindNotifyHandlerOnce() {
     log('BLE<-', {
       crcOk: parsed.crcOk,
       flag: parsed.flag,
-      cmd: cmdData ? `0x${cmdData.cmd.toString(16)}` : null,
-      key: cmdData ? `0x${cmdData.key.toString(16)}` : null,
+      cmdKey: cmdData ? `0x${cmdData.cmdKey.toString(16)}` : null,
       keyFlag: cmdData ? `0x${cmdData.keyFlag.toString(16)}` : null,
       valueLen: cmdData?.value?.length || 0
     })
+    handleProtocolData(cmdData, parsed)
   })
 }
 
-async function rwWrite(buffer, title) {
-  if (nativeBridge.isAvailable()) {
-    log(`${title}：当前由原生插件托管`)
-    return true
+function waitForResponse(matcher, timeout = 2500) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      pendingResolvers = pendingResolvers.filter((item) => item.resolve !== resolve)
+      reject(new Error('BLE response timeout'))
+    }, timeout)
+    pendingResolvers.push({ matcher, resolve, timer })
+  })
+}
+
+async function rwWrite(buffer, title, options = {}) {
+  const task = async () => {
+    const waiter = options.wait ? waitForResponse(options.wait, options.timeout) : null
+    await writePacket(buffer)
+    log(`${title}：已发送`)
+    return waiter || true
   }
-  await writePacket(buffer)
-  log(`${title}：已发送`)
-  return true
+  commandQueue = commandQueue.then(task, task)
+  return commandQueue
+}
+
+function waitByCmdKey(cmdKey, keyFlag) {
+  return (cmdData) => cmdData.cmdKey === cmdKey && (keyFlag === undefined || cmdData.keyFlag === keyFlag)
+}
+
+function waitForRealtime(type = 'hr', timeout = 20000) {
+  return waitForResponse((cmdData) => {
+    const realtime = parseRealtimeValue(cmdData.cmdKey, cmdData.value)
+    return !!realtime && realtime.type === type && realtime.value !== undefined && realtime.value !== null && Number(realtime.value) > 0
+  }, timeout)
 }
 
 function mutateSetting(path, value) {
@@ -370,86 +428,11 @@ function parseHHmm(value, fallback) {
   return { hour, minute }
 }
 
-function ensureNativeEvents() {
-  if (!nativeBridge.isAvailable() || nativeSubscribed) return
-  nativeSubscribed = true
-  nativeBridge.subscribe(({ event, payload }) => {
-    if (event === 'scanDevice' && payload?.device) {
-      upsertDevice(payload.device)
-      return
-    }
-    if (event === 'scanFinish') {
-      state.scanning = false
-      emit()
-      return
-    }
-    if (event === 'connect') {
-      if (payload?.action === 'onRingConnecting') state.connecting = true
-      if (payload?.action === 'onRingConnected') {
-        state.connected = true
-        state.connecting = false
-      }
-      if (!payload?.ok) {
-        state.connected = false
-        state.connecting = false
-        state.supportReady = false
-      }
-      log(payload?.message || '连接事件', payload)
-      emit()
-      return
-    }
-    if (event === 'support' && payload?.support) {
-      state.support = Object.assign({}, state.support, payload.support)
-      state.supportReady = true
-      log('功能配置表已返回', payload.support)
-      emit()
-      return
-    }
-    if (event === 'syncProgress') {
-      state.health.syncSummary = `同步中 ${payload?.progress || 0}%`
-      emit()
-      return
-    }
-    if (event === 'syncFinish') {
-      state.health.syncSummary = '已同步完成'
-      emit()
-      return
-    }
-    if (event === 'syncData') {
-      applySyncData(payload)
-      return
-    }
-    if (event === 'healthControlProgress') {
-      const type = payload?.type
-      if (type && typeof payload?.value !== 'undefined') {
-        if (type === 'hr') state.health.hr = payload.value
-        log(`${type} 实时进度`, payload)
-        emit()
-      }
-      return
-    }
-    log(payload?.message || event, payload)
-  })
-}
-
-function applySyncData(payload) {
-  const type = payload?.type
-  const data = payload?.data || []
-  if (type === 'step' && data.length) state.health.steps = data[data.length - 1]?.stepNum || state.health.steps
-  if (type === 'sleep') state.health.sleep = data
-  if (type === 'hr' && data.length) state.health.hr = data[data.length - 1]?.items?.slice?.(-1)?.[0]?.heartValue || state.health.hr
-  if (type === 'bo' && data.length) state.health.bo = data[data.length - 1]?.items?.slice?.(-1)?.[0]?.bo || state.health.bo
-  if (type === 'pressure' && data.length) state.health.stress = data[data.length - 1]?.items?.slice?.(-1)?.[0]?.pressure || state.health.stress
-  if (type === 'bloodSugar' && data.length) state.health.bloodSugar = data[data.length - 1]?.items?.slice?.(-1)?.[0]?.bloodSugar || state.health.bloodSugar
-  if (type === 'hrv' && data.length) state.health.hrv = data[data.length - 1]?.items?.slice?.(-1)?.[0]?.hrv || state.health.hrv
-  state.health.syncSummary = `已同步 ${type}`
-  emit()
-}
-
-async function runNative(method, fallback) {
-  ensureNativeEvents()
-  if (!nativeBridge.isAvailable()) return fallback()
-  return method()
+function injectMockDevices(reason) {
+  if (state.devices.length) return
+  upsertDevice({ deviceId: 'MOCK:SY02:001', name: 'SY02', RSSI: -42 })
+  upsertDevice({ deviceId: 'MOCK:SY02:002', name: 'RW-RING', RSSI: -51 })
+  log(reason)
 }
 
 export default {
@@ -463,27 +446,14 @@ export default {
     }
   },
   async init() {
-    ensureNativeEvents()
     const granted = await requestBluetoothPermissions()
     if (!granted) {
       state.initialized = false
       log('蓝牙权限未授权，SDK 暂未初始化')
       return false
     }
-
-    if (nativeBridge.isAvailable()) {
-      try {
-        await nativeBridge.init()
-        state.initialized = true
-        log('原生插件初始化完成')
-        return true
-      } catch (error) {
-        state.initialized = false
-        log('原生插件初始化失败，回退到演示模式', error)
-      }
-    }
     state.initialized = true
-    log('当前未检测到原生插件，使用演示模式')
+    log('蓝牙 SDK 初始化完成')
     return true
   },
   async startScan() {
@@ -494,451 +464,383 @@ export default {
     state.scanning = true
     state.devices = []
     emit()
-    return runNative(
-      () => nativeBridge.startScan(),
-      async () => new Promise((resolve) => {
-        try {
-          uni.openBluetoothAdapter({
-            success: () => {
-              try {
-                uni.offBluetoothDeviceFound && uni.offBluetoothDeviceFound()
-              } catch (error) {}
-              uni.onBluetoothDeviceFound((res) => {
-                const list = res?.devices || []
-                list.forEach((d) => {
-                  if (!d?.deviceId) return
-                  upsertDevice(d)
-                })
+    return new Promise((resolve) => {
+      try {
+        uni.openBluetoothAdapter({
+          success: () => {
+            try {
+              uni.offBluetoothDeviceFound && uni.offBluetoothDeviceFound()
+            } catch (error) {}
+            uni.onBluetoothDeviceFound((res) => {
+              const list = res?.devices || []
+              list.forEach((d) => {
+                if (!d?.deviceId) return
+                upsertDevice(d)
               })
-              uni.startBluetoothDevicesDiscovery({
-                allowDuplicatesKey: true,
-                success: () => {
-                  log('开始蓝牙扫描')
-                  resolve(true)
-                },
-                fail: () => {
-                  setTimeout(() => {
-                    if (!state.devices.length) {
-                      upsertDevice({ deviceId: 'MOCK:SY02:001', name: 'SY02', RSSI: -42 })
-                      upsertDevice({ deviceId: 'MOCK:SY02:002', name: 'RW-RING', RSSI: -51 })
-                      log('扫描失败，已显示演示设备列表')
-                    }
-                    resolve(true)
-                  }, 600)
-                }
-              })
-            },
-            fail: () => {
-              setTimeout(() => {
-                if (!state.devices.length) {
-                  upsertDevice({ deviceId: 'MOCK:SY02:001', name: 'SY02', RSSI: -42 })
-                  upsertDevice({ deviceId: 'MOCK:SY02:002', name: 'RW-RING', RSSI: -51 })
-                  log('蓝牙不可用，已显示演示设备列表')
-                }
+            })
+            uni.startBluetoothDevicesDiscovery({
+              allowDuplicatesKey: true,
+              success: () => {
+                log('开始蓝牙扫描')
                 resolve(true)
-              }, 300)
-            }
-          })
-        } catch (error) {
-          setTimeout(() => {
-            if (!state.devices.length) {
-              upsertDevice({ deviceId: 'MOCK:SY02:001', name: 'SY02', RSSI: -42 })
-              upsertDevice({ deviceId: 'MOCK:SY02:002', name: 'RW-RING', RSSI: -51 })
-              log('扫描异常，已显示演示设备列表')
-            }
-            resolve(true)
-          }, 300)
-        }
-      })
-    )
+              },
+              fail: () => {
+                setTimeout(() => {
+                  injectMockDevices('扫描失败，已显示演示设备列表')
+                  resolve(true)
+                }, 600)
+              }
+            })
+          },
+          fail: () => {
+            setTimeout(() => {
+              injectMockDevices('蓝牙不可用，已显示演示设备列表')
+              resolve(true)
+            }, 300)
+          }
+        })
+      } catch (error) {
+        setTimeout(() => {
+          injectMockDevices('扫描异常，已显示演示设备列表')
+          resolve(true)
+        }, 300)
+      }
+    })
   },
   stopScan() {
     state.scanning = false
-    if (nativeBridge.isAvailable()) nativeBridge.stopScan().catch(() => {})
-    else uni.stopBluetoothDevicesDiscovery({ complete: () => emit() })
+    uni.stopBluetoothDevicesDiscovery({ complete: () => emit() })
     log('停止扫描')
   },
   async connect(device) {
     state.connecting = true
     emit()
     const target = normalizeDevice(device)
-    return runNative(
-      async () => {
-        await nativeBridge.connect({ bleMac: target.bleMac })
-        state.device = target
-        log('连接指令已发送', target)
-      },
-      () => new Promise((resolve, reject) => {
-        setupMiniProgramBle(target)
-          .then(() => {
-            state.connected = true
-            state.connecting = false
-            state.supportReady = true
-            state.device = target
-            state.support = { ...defaultSupport }
-            state.settings = JSON.parse(JSON.stringify(defaultSettings))
-            state.deviceInfo.power = nextValue('power')
-            this.stopScan()
-            startMockHealth()
-            log('连接成功，已建立 BLE 服务与特征，可开始业务操作', { device: target, support: state.support, bleRuntime })
-            emit()
-            resolve(clone(state))
-          })
-          .catch((error) => {
-            state.connecting = false
-            state.connected = false
-            emit()
-            reject(error)
-          })
-      })
-    )
+    return new Promise((resolve, reject) => {
+      setupMiniProgramBle(target)
+        .then(() => {
+          state.connected = true
+          state.connecting = false
+          state.supportReady = true
+          state.device = target
+          state.support = { ...defaultSupport }
+          state.settings = JSON.parse(JSON.stringify(defaultSettings))
+          state.deviceInfo.power = null
+          this.stopScan()
+          log('连接成功，已建立小程序协议 BLE 服务与特征，开始登录/时区/时间初始化', { device: target, support: state.support, bleRuntime })
+          Promise.resolve()
+            .then(() => this.rwLogin())
+            .then(() => this.rwSetTimezone())
+            .then(() => this.rwSetTime())
+            .then(() => this.getFirmware())
+            .then(() => this.getPower())
+            .then(() => this.getMac())
+            .catch((error) => log('初始化指令未全部完成', { message: error.message }))
+          emit()
+          resolve(clone(state))
+        })
+        .catch((error) => {
+          state.connecting = false
+          state.connected = false
+          emit()
+          reject(error)
+        })
+    })
   },
   disconnect() {
-    if (nativeBridge.isAvailable()) nativeBridge.disconnect().catch(() => {})
-    else {
-      try { uni.closeBLEConnection({ deviceId: bleRuntime?.deviceId }) } catch (error) {}
-      bleRuntime = null
-    }
+    try { uni.closeBLEConnection({ deviceId: bleRuntime?.deviceId }) } catch (error) {}
+    bleRuntime = null
     state.connected = false
     state.connecting = false
     state.supportReady = false
     state.device = null
     state.monitoring = { hr: false, bo: false, hrv: false, stress: false, bloodSugar: false, takePhoto: false, sportPush: false }
-    stopMockHealth()
     log('设备已断开')
     emit()
   },
   async getSDKVersion() {
-    return runNative(
-      async () => {
-        const result = await nativeBridge.getSDKVersion()
-        state.deviceInfo.sdkVersion = result.sdkVersion || state.deviceInfo.sdkVersion
-        emit()
-        return state.deviceInfo.sdkVersion
-      },
-      async () => {
-        log('获取 SDK 版本', state.deviceInfo.sdkVersion)
-        return state.deviceInfo.sdkVersion
-      }
-    )
+    log('获取 SDK 版本', state.deviceInfo.sdkVersion)
+    return state.deviceInfo.sdkVersion
   },
   async setUserInfo(data) {
     requireConnected()
-    return runNative(() => nativeBridge.setUserInfo(data), async () => {
-      log('设置用户信息', data)
-      return true
-    })
+    await rwWrite(commandSetUserInfo(data), '设置用户信息', { wait: waitByCmdKey(0x0206, 0x00) })
+    return true
   },
   async getFirmware() {
     requireConnected()
-    return runNative(
-      async () => {
-        const result = await nativeBridge.getFirmware()
-        const firmware = result.firmware || {}
-        state.deviceInfo.firmwareVersion = firmware.firmwareVersion || firmware.version || state.deviceInfo.firmwareVersion
-        state.deviceInfo.uiVersion = firmware.uiVersion || state.deviceInfo.uiVersion
-        emit()
-        return result
-      },
-      async () => {
-        const result = { firmwareVersion: state.deviceInfo.firmwareVersion, uiVersion: state.deviceInfo.uiVersion }
-        log('获取设备信息', result)
-        return result
-      }
-    )
+    const res = await rwWrite(commandGetFirmware(), '获取设备版本信息', { wait: waitByCmdKey(0x0204, 0x10) })
+    const info = parseFirmwareValue(res.cmdData.value) || {}
+    Object.assign(state.deviceInfo, info)
+    emit()
+    return clone(state.deviceInfo)
   },
   async getPower() {
     requireConnected()
-    return runNative(
-      async () => {
-        const result = await nativeBridge.getPower()
-        state.deviceInfo.power = result.power ?? state.deviceInfo.power
-        emit()
-        return result
-      },
-      async () => {
-        state.deviceInfo.power = nextValue('power')
-        log('获取设备电量', state.deviceInfo.power)
-        emit()
-        return { power: state.deviceInfo.power }
-      }
-    )
+    const res = await rwWrite(commandGetPower(), '获取设备电量', { wait: waitByCmdKey(0x0203, 0x10) })
+    if (res.cmdData.value.length) state.deviceInfo.power = res.cmdData.value[0]
+    emit()
+    return { power: state.deviceInfo.power }
   },
-  async setVideoHid(enabled) {
+  async getMac() {
     requireConnected()
+    const res = await rwWrite(commandGetMac(), '获取 MAC 地址', { wait: waitByCmdKey(0x0205, 0x10) })
+    state.deviceInfo.mac = parseMac(res.cmdData.value)
+    emit()
+    return state.deviceInfo.mac
+  },
+  async getRestingHealth() {
+    requireConnected()
+    const res = await rwWrite(commandGetRestingHealth(), '获取静息健康数据', { wait: waitByCmdKey(0x0281, 0x10) })
+    state.health.resting = parseRestingHealth(res.cmdData.value)
+    emit()
+    return state.health.resting
+  },
+  async setVideoHid(enabled, type = 1) {
+    requireConnected()
+    await rwWrite(commandSetVideoHid(enabled, type), `HID 应用控制${enabled ? '开启' : '关闭'}`, { wait: waitByCmdKey(0x0264, 0x00) })
     mutateSetting('videoHid', enabled)
-    return runNative(() => nativeBridge.setVideoHid(enabled), async () => {
-      log(`视频控制${enabled ? '开启' : '关闭'}`)
-      return true
-    })
+    return true
   },
   async setLedLevel(enabled, level) {
     requireConnected()
+    await rwWrite(commandSetLedLevel(enabled, level), '设置 LED 亮屏强度', { wait: waitByCmdKey(0x0266, 0x00) })
     mutateSetting('ledLevel', { enabled, level })
-    return runNative(() => nativeBridge.setLedLevel(enabled, level), async () => {
-      log('设置 LED 亮屏强度', { enabled, level })
-      return true
-    })
+    return true
   },
   async setWearHand(rightHand) {
     requireConnected()
+    await rwWrite(commandSetWearHand(rightHand), '设置佩戴位置', { wait: waitByCmdKey(0x0268, 0x00) })
     mutateSetting('wearHand', rightHand ? 'right' : 'left')
-    return runNative(() => nativeBridge.setWearHand(rightHand), async () => {
-      log('设置佩戴位置', rightHand ? '右手' : '左手')
-      return true
-    })
+    return true
+  },
+  async setBleName(name) {
+    requireConnected()
+    await rwWrite(commandSetBleName(name), '修改蓝牙名称', { wait: waitByCmdKey(0x0265, 0x00) })
+    return true
   },
   async controlTakePhoto(enabled) {
     requireConnected()
+    await rwWrite(commandControlPhoto(enabled ? 1 : 0), `拍照控制${enabled ? '开启' : '关闭'}`, { wait: waitByCmdKey(0x0601, 0x00) })
     state.monitoring.takePhoto = enabled
     emit()
-    return runNative(() => nativeBridge.controlTakePhoto(enabled), async () => {
-      log(`拍照控制${enabled ? '开启' : '关闭'}`)
-      return true
-    })
+    return true
   },
   async findDevice() {
     requireConnected()
-    return runNative(() => nativeBridge.findDevice(), async () => rwWrite(commandFindDevice(true), '查找设备'))
+    return rwWrite(commandFindDevice(true), '查找设备', { wait: waitByCmdKey(0x0234, 0x00) })
   },
   async rwLogin() {
     requireConnected()
-    return rwWrite(commandLogin(), '设备登录')
+    return rwWrite(commandLogin(), '设备认证登录', { wait: waitByCmdKey(0x0302, 0x20), timeout: 1800 })
   },
   async rwSetTimezone() {
     requireConnected()
-    return rwWrite(commandSetTimezone(buildTimezoneQuarterHours()), '设置时区')
+    return rwWrite(commandSetTimezone(buildTimezoneQuarterHours()), '设置时区', { wait: waitByCmdKey(0x0202, 0x00) })
   },
   async rwSetTime() {
     requireConnected()
-    return rwWrite(commandSetTime(new Date()), '设置时间')
+    return rwWrite(commandSetTime(new Date()), '设置时间', { wait: waitByCmdKey(0x0201, 0x00) })
   },
   async rwSingleTest(type = 'hr', start = true, continuous = false) {
     requireConnected()
     const code = TEST_TYPES[type] || TEST_TYPES.hr
-    return rwWrite(
+    await rwWrite(
       start ? commandStartSingleTest(code, continuous) : commandStopSingleTest(code),
-      `${start ? '启动' : '停止'}单次检测(${type}${start && continuous ? '-连续' : ''})`
+      `${start ? '启动' : '停止'}单次检测(${type}${start && continuous ? '-连续' : ''})`,
+      { wait: waitByCmdKey(0x0609, 0x00) }
     )
+    return true
   },
   async powerOff(type) {
     requireConnected()
-    return runNative(() => nativeBridge.powerOff(type), async () => {
-      log(type === 'recovery' ? '恢复出厂设置指令已发送' : '关机指令已发送')
-      return true
-    })
+    await rwWrite(commandPowerOff(type === 'recovery' ? 2 : 1), type === 'recovery' ? '恢复出厂设置' : '关机', { wait: waitByCmdKey(0x0222, 0x00) })
+    return true
   },
   async getAlarms() {
     requireConnected()
-    return runNative(
-      async () => {
-        const result = await nativeBridge.getAlarms()
-        mutateSetting('alarms', result.alarms || [])
-        return result.alarms || []
-      },
-      async () => {
-        log('获取闹钟列表', state.settings.alarms)
-        return clone(state.settings.alarms)
-      }
-    )
+    log('获取闹钟列表', state.settings.alarms)
+    return clone(state.settings.alarms)
   },
   async setAlarmList(list) {
     requireConnected()
     mutateSetting('alarms', list)
-    return runNative(() => nativeBridge.setAlarmList(list), async () => {
-      log('重新下发全部闹钟配置', list)
-      return true
-    })
+    log('重新下发全部闹钟配置', list)
+    return true
   },
   async deleteAllAlarms() {
     requireConnected()
     mutateSetting('alarms', [])
-    return runNative(() => nativeBridge.deleteAllAlarms(), async () => {
-      log('删除全部闹钟')
-      return true
-    })
+    log('删除全部闹钟')
+    return true
   },
   async setVibration(level, count) {
     requireConnected()
     mutateSetting('vibration', { level, count })
-    return runNative(() => nativeBridge.setVibration(level, count), async () => {
-      log('设置震动次数与等级', { level, count })
-      return true
-    })
+    log('设置震动次数与等级', { level, count })
+    return true
   },
   async setScreenSleep(enabled, start = '20:00', end = '08:00') {
     requireConnected()
     mutateSetting('screenSleep', enabled)
     mutateSetting('screenSleepStart', start)
     mutateSetting('screenSleepEnd', end)
-    const begin = parseHHmm(start, '20:00')
-    const finish = parseHHmm(end, '08:00')
-    return runNative(
-      () => nativeBridge.setScreenSleep({ enabled, startHour: begin.hour, startMin: begin.minute, endHour: finish.hour, endMin: finish.minute }),
-      async () => {
-        log('设置屏幕睡眠模式', { enabled, start, end })
-        return true
-      }
-    )
+    log('设置屏幕睡眠模式', { enabled, start, end })
+    return true
   },
   async pushMessage(data) {
     requireConnected()
-    return runNative(() => nativeBridge.pushMessage(data), async () => {
-      log('消息推送测试', data)
-      return true
-    })
+    log('消息推送测试', data)
+    return true
   },
   async setMuslimReminder(enabled) {
     requireConnected()
     mutateSetting('muslimReminder', enabled)
-    return runNative(() => nativeBridge.setMuslimReminder(enabled), async () => {
-      log(`赞念开关${enabled ? '开启' : '关闭'}`)
-      return true
-    })
+    log(`赞念开关${enabled ? '开启' : '关闭'}`)
+    return true
   },
   async setHrAlarm(enabled, value, underValue = 255) {
     requireConnected()
+    await rwWrite(commandGenericWrite(0x02, 0x17, [enabled ? 1 : 0, value & 0xff, underValue & 0xff]), '设置心率报警')
     mutateSetting('hrAlarm', { enabled, value, underValue })
-    return runNative(() => nativeBridge.setHrAlarm({ enabled, value, underValue }), async () => {
-      log('设置心率报警', { enabled, value, underValue })
-      return true
-    })
+    return true
   },
   async setBoAlarm(enabled, value) {
     requireConnected()
+    await rwWrite(commandGenericWrite(0x02, 0x26, [enabled ? 1 : 0, value & 0xff]), '设置血氧报警')
     mutateSetting('boAlarm', { enabled, value })
-    return runNative(() => nativeBridge.setBoAlarm({ enabled, value }), async () => {
-      log('设置血氧报警', { enabled, value })
-      return true
-    })
+    return true
   },
   async setScreenTime(seconds) {
     requireConnected()
     mutateSetting('screenTime', seconds)
-    return runNative(() => nativeBridge.setScreenTime(seconds), async () => {
-      log('设置亮屏时长', { seconds })
-      return true
-    })
+    log('设置亮屏时长', { seconds })
+    return true
   },
   async setRaiseScreen(enabled, start = '08:00', end = '20:00') {
     requireConnected()
     mutateSetting('raiseScreen', enabled)
     mutateSetting('raiseScreenStart', start)
     mutateSetting('raiseScreenEnd', end)
-    const begin = parseHHmm(start, '08:00')
-    const finish = parseHHmm(end, '20:00')
-    return runNative(
-      () => nativeBridge.setRaiseScreen({ enabled, startHour: begin.hour, startMin: begin.minute, endHour: finish.hour, endMin: finish.minute }),
-      async () => {
-        log('设置抬腕亮屏', { enabled, start, end })
-        return true
-      }
-    )
+    log('设置抬腕亮屏', { enabled, start, end })
+    return true
   },
   async setTimeFormat(value) {
     requireConnected()
     mutateSetting('timeFormat', value)
-    return runNative(() => nativeBridge.setTimeFormat(value), async () => {
-      log(`设置时间格式 ${value} 小时制`)
-      return true
-    })
+    log(`设置时间格式 ${value} 小时制`)
+    return true
   },
   async controlHealth(type, enabled) {
     requireConnected()
+    if (enabled) clearRealtimeValue(type)
+    await this.rwSingleTest(type, enabled, enabled)
     state.monitoring[type] = enabled
-    if (enabled) updateRealtimeHealth()
     emit()
-    return runNative(() => nativeBridge.controlHealth(type, enabled), async () => {
-      log(`${type} 实时测量${enabled ? '开启' : '关闭'}`)
-      return true
-    })
+    log(`${type} 实时测量${enabled ? '已启动，等待戒指真实回传' : '已停止'}`)
+    return true
+  },
+  async verifyHeartRateTransfer(timeout = 20000) {
+    requireConnected()
+    log('开始验证戒指连接：查找设备回包 + 心率实时回传')
+    await this.findDevice()
+    log('连接验证第 1 步通过：戒指已回复查找设备指令')
+    clearRealtimeValue('hr')
+    const realtimeWaiter = waitForRealtime('hr', timeout)
+    await this.rwSingleTest('hr', true, true)
+    state.monitoring.hr = true
+    emit()
+    const res = await realtimeWaiter
+    const realtime = parseRealtimeValue(res.cmdData.cmdKey, res.cmdData.value)
+    log('连接验证成功：已收到戒指心率实时数据', realtime)
+    return { ok: true, type: 'hr', value: realtime.value, time: realtime.time }
   },
   async setTimedMonitor(type, enabled, duration = 60) {
     requireConnected()
-    state.settings.timedMonitor[type] = { enabled, duration }
+    await rwWrite(commandTimedMonitor(type, enabled, duration), `设置 ${type} 全天监听`, { wait: (cmdData) => cmdData.cmd === 0x02 && cmdData.keyFlag === 0x00 })
+    state.settings.timedMonitor[type] = { enabled, duration: type === 'hr' ? duration : 60 }
     emit()
-    log(`设置 ${type} 全天监听`, { enabled, duration })
     return true
   },
   async syncHealthData(type = 'all') {
     requireConnected()
-    return runNative(
-      () => nativeBridge.syncHealthData(type),
-      async () => {
-        const map = {
-          step: HISTORY_TYPES.step,
-          todayStep: HISTORY_TYPES.todayStep,
-          sleep: HISTORY_TYPES.sleep,
-          hr: HISTORY_TYPES.hr,
-          bo: HISTORY_TYPES.bo,
-          stress: HISTORY_TYPES.stress,
-          hrv: HISTORY_TYPES.hrv,
-          bloodSugar: HISTORY_TYPES.bloodSugar,
-          bloodPressure: HISTORY_TYPES.bloodPressure
-        }
+    const map = {
+      todayStep: HISTORY_TYPES.todayStep,
+      today_step: HISTORY_TYPES.todayStep,
+      step: HISTORY_TYPES.step,
+      sleep: HISTORY_TYPES.sleep,
+      hr: HISTORY_TYPES.hr,
+      bo: HISTORY_TYPES.bo,
+      stress: HISTORY_TYPES.stress,
+      hrv: HISTORY_TYPES.hrv,
+      bloodSugar: HISTORY_TYPES.bloodSugar,
+      bloodPressure: HISTORY_TYPES.bloodPressure
+    }
 
-        const targets = type === 'all'
-          ? [
-              'todayStep', 'step', 'sleep', 'hr', 'bo',
-              'stress', 'hrv', 'bloodSugar', 'bloodPressure'
-            ]
-          : [type]
+    const targets = type === 'all'
+      ? ['todayStep', 'step', 'sleep', 'hr', 'bo', 'stress', 'hrv', 'bloodSugar', 'bloodPressure']
+      : [type]
 
-        for (let i = 0; i < targets.length; i += 1) {
-          const key = targets[i]
-          const t = map[key]
-          if (!t) continue
-          state.health.syncSummary = `同步中 ${key}...`
-          emit()
+    const result = {}
+    for (let i = 0; i < targets.length; i += 1) {
+      const key = targets[i]
+      const historyKey = map[key]
+      if (historyKey === undefined) continue
+      const items = []
+      state.health.syncSummary = `同步中 ${key}...`
+      emit()
 
-          let rounds = 0
-          while (rounds < 20) {
-            rounds += 1
-            await rwWrite(commandReadHistory(t), `读取历史(${key})`)
-            await new Promise((resolve) => setTimeout(resolve, 220))
-            if (rounds >= 2) break
-            await rwWrite(commandDeleteHistory(t), `删除历史块(${key})`)
-            await new Promise((resolve) => setTimeout(resolve, 180))
-          }
-
-          if (key === 'step' || key === 'todayStep') state.health.steps = nextValue('steps')
-          if (key === 'hr') state.health.hr = nextValue('hr')
-          if (key === 'bo') state.health.bo = nextValue('bo')
-          if (key === 'hrv') state.health.hrv = nextValue('hrv')
-          if (key === 'stress') state.health.stress = nextValue('stress')
-          if (key === 'bloodSugar') state.health.bloodSugar = (nextValue('bloodSugar') / 10).toFixed(1)
-          if (key === 'sleep') state.health.sleep = [{ time: '昨晚', totalSleepTime: 426, asleepTime: 22, awakeTime: 19 }]
-          emit()
-        }
-
-        state.health.syncSummary = type === 'all' ? '已按协议触发全部历史同步' : `已触发 ${type} 同步`
-        log('健康历史数据同步流程执行完成', { type })
-        emit()
-        return { ok: true, type }
+      let rounds = 0
+      while (rounds < 60) {
+        rounds += 1
+        lastHistoryBlock = null
+        const res = await rwWrite(commandReadHistory(historyKey), `读取历史(${key})`, { wait: (cmdData) => cmdData.cmd === 0x05 && cmdData.key === historyKey && cmdData.keyFlag === 0x10, timeout: 4000 })
+        const value = res.cmdData.value || []
+        if (!value.length) break
+        items.push(...parseHistoryItems(key, value))
+        await rwWrite(commandDeleteHistory(historyKey), `删除历史块(${key})`, { wait: (cmdData) => cmdData.cmd === 0x05 && cmdData.key === historyKey && cmdData.keyFlag === 0x30, timeout: 2500 })
       }
-    )
+
+      result[key] = items
+      state.health.histories[key] = items
+      const latest = items[items.length - 1]
+      if ((key === 'step' || key === 'todayStep' || key === 'today_step') && latest) state.health.steps = latest.steps
+      if (key === 'hr' && latest) state.health.hr = latest.value
+      if (key === 'bo' && latest) state.health.bo = latest.value
+      if (key === 'hrv' && latest) state.health.hrv = latest.value
+      if (key === 'stress' && latest) state.health.stress = latest.value
+      if (key === 'bloodSugar' && latest) state.health.bloodSugar = latest.value
+      if (key === 'bloodPressure' && latest) state.health.bloodPressure = latest
+      if (key === 'sleep') state.health.sleep = items
+      emit()
+    }
+
+    state.health.syncSummary = type === 'all' ? '全部历史同步完成' : `${type} 同步完成`
+    log('健康历史数据同步流程执行完成', { type, counts: Object.keys(result).reduce((acc, key) => ({ ...acc, [key]: result[key].length }), {}) })
+    emit()
+    return { ok: true, type, result }
   },
   async controlSport(action) {
     requireConnected()
-    return runNative(() => nativeBridge.controlSport(action), async () => {
-      log(`多运动控制：${action}`)
-      return true
-    })
+    log(`多运动控制：${action}`)
+    return true
   },
   async setSportPush(enabled) {
     requireConnected()
     state.monitoring.sportPush = enabled
     emit()
-    return runNative(() => nativeBridge.setSportPush(enabled), async () => {
-      log(`运动实时通知${enabled ? '开启' : '关闭'}`)
-      return true
-    })
+    log(`运动实时通知${enabled ? '开启' : '关闭'}`)
+    return true
+  },
+  async controlSensor(sensorType = 3, enabled = true) {
+    requireConnected()
+    await rwWrite(commandSensorOutput(sensorType, enabled), `${enabled ? '开启' : '关闭'} Sensor 原始数据`, { wait: waitByCmdKey(0x02fa, 0x00) })
+    return true
   },
   async startOta(path = '') {
     requireConnected()
-    return runNative(() => nativeBridge.startOta(path), async () => {
-      log('OTA 升级入口已触发，正式接入需在原生插件传入 bin 路径')
-      return true
-    })
+    otaRuntime = { path, serviceId: 'FF00', characteristicId: 'FF01', status: 'ready' }
+    log('OTA 升级入口已按小程序协议准备：需选择 bin 后按 FF00/FF01 流程发送 init/create/data/upgrade/reset', otaRuntime)
+    return otaRuntime
   }
 }

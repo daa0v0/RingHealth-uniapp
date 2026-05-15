@@ -1,8 +1,8 @@
 {
-    "name" : "uniapp-starbase",
+    "name" : "星枢",
     "appid" : "__UNI__91861EF",
     "description" : "星枢移动端页面示例",
-    "versionName" : "1.0.1",
+    "versionName" : "1.0.2",
     "versionCode" : "100",
     "transformPx" : false,
     "app-plus" : {
@@ -16,9 +16,6 @@
             "delay" : 0
         },
         "modules" : {
-            "RWBleModule" : {
-                "description" : "RW BLE Android SDK bridge"
-            },
             "bluetooth" : {}
         },
         "distribute" : {
@@ -35,22 +32,6 @@
             },
             "ios" : {
                 "dSYMs" : false
-            }
-        },
-        "nativePlugins" : {
-            "RWBleModule" : {
-                "__plugin_info__" : {
-                    "name" : "RWBleModule",
-                    "description" : "RW BLE Android SDK bridge for uni-app",
-                    "platforms" : "Android",
-                    "url" : "",
-                    "android_package_name" : "",
-                    "ios_bundle_id" : "",
-                    "isCloud" : false,
-                    "bought" : -1,
-                    "pid" : "",
-                    "parameters" : {}
-                }
             }
         }
     },

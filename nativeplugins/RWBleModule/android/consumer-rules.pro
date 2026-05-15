@@ -1,3 +1,0 @@
--keep class com.example.blesdk.** { *; }
--keep class com.starbase.rwble.** { *; }
--dontwarn com.example.blesdk.**

@@ -1,5 +1,5 @@
 <template>
-  <view class="safe-page info-page">
+  <view class="safe-page info-page" :class="{ dark: isDarkMode }">
     <view class="topbar">
       <image class="back-icon" src="/static/images/common/ic_back.webp" mode="aspectFit" @tap="back"></image>
       <text class="top-title">通用设置</text>
@@ -24,9 +24,9 @@
       <view class="cell border">
         <view>
           <text class="label">深色模式</text>
-          <text class="desc">当前为浅色模式演示版</text>
+          <text class="desc">{{ isDarkMode ? '当前为深色模式' : '当前为浅色模式' }}</text>
         </view>
-        <switch color="#a7795e" :checked="false" />
+        <switch color="#a7795e" :checked="isDarkMode" @change="toggleDarkMode" />
       </view>
       <view class="cell">
         <view>
@@ -40,10 +40,25 @@
 </template>
 
 <script>
+const THEME_KEY = 'starbase_theme'
+
 export default {
+  data() {
+    return {
+      isDarkMode: uni.getStorageSync(THEME_KEY) === 'dark'
+    }
+  },
+  onShow() {
+    this.isDarkMode = uni.getStorageSync(THEME_KEY) === 'dark'
+  },
   methods: {
     back() {
       uni.navigateBack()
+    },
+    toggleDarkMode(event) {
+      this.isDarkMode = event.detail.value
+      uni.setStorageSync(THEME_KEY, this.isDarkMode ? 'dark' : 'light')
+      uni.$emit('theme-change', this.isDarkMode ? 'dark' : 'light')
     },
     clearCache() {
       uni.showToast({ title: '已清理缓存', icon: 'none' })
@@ -57,6 +72,9 @@ export default {
   min-height: 100vh;
   background: #f6f6f8;
   padding: calc(var(--status-bar-height) + 20rpx) 24rpx 40rpx;
+}
+.info-page.dark {
+  background: #141414;
 }
 .topbar {
   height: 72rpx;
@@ -107,5 +125,19 @@ export default {
   color: #a7795e;
   font-size: 26rpx;
   font-weight: 600;
+}
+.dark .top-title,
+.dark .label {
+  color: #f2f2f2;
+}
+.dark .group-card {
+  background: #232323;
+  box-shadow: none;
+}
+.dark .desc {
+  color: #aaa39d;
+}
+.dark .cell.border {
+  border-bottom-color: #333333;
 }
 </style>

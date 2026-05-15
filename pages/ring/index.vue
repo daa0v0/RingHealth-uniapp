@@ -197,7 +197,7 @@
 
     <view class="section logs">
       <text class="section-title">运行日志</text>
-      <view v-for="log in logs" :key="log.time + log.message" class="log-item">
+      <view v-for="(log, index) in logs" :key="log.id || (log.time + log.message + index)" class="log-item">
         <text class="log-time">{{ log.time }}</text>
         <text class="log-msg">{{ log.message }}</text>
       </view>
@@ -237,6 +237,7 @@ export default {
         { action: 'firmware', text: '固件信息', icon: '⌘' },
         { action: 'power', text: '获取电量', icon: '▰' },
         { action: 'findDevice', text: '查找设备', icon: '◎' },
+        { action: 'verifyHr', text: '立即检测心率', icon: '♥' },
         { action: 'syncAll', text: '同步全部健康', icon: '↻' },
         { action: 'syncSteps', text: '同步今日步数', icon: '⋯' },
         { action: 'takePhoto', text: '拍照控制', icon: '◉' }
@@ -376,6 +377,7 @@ export default {
         firmware: () => ringSdk.getFirmware(),
         power: () => ringSdk.getPower(),
         findDevice: () => ringSdk.findDevice(),
+        verifyHr: () => ringSdk.verifyHeartRateTransfer(),
         syncAll: () => ringSdk.syncHealthData('all'),
         syncSteps: () => ringSdk.syncHealthData('today_step'),
         takePhoto: () => ringSdk.controlTakePhoto(!this.monitoring.takePhoto),
@@ -402,9 +404,15 @@ export default {
       }
       if (!actions[action]) return
       try {
-        await actions[action]()
-        uni.showToast({ title: '操作完成', icon: 'success' })
-      } catch (error) {}
+        const result = await actions[action]()
+        if (action === 'verifyHr' && result?.value) {
+          uni.showToast({ title: `心率 ${result.value} BPM`, icon: 'success' })
+        } else {
+          uni.showToast({ title: '操作完成', icon: 'success' })
+        }
+      } catch (error) {
+        uni.showToast({ title: error?.message || '操作失败', icon: 'none' })
+      }
     }
   }
 }

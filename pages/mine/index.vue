@@ -1,18 +1,18 @@
 <template>
-  <view class="safe-page mine-page">
+  <view class="safe-page mine-page" :class="{ dark: isDarkMode }">
     <view class="hero">
       <image class="hero-bg" src="/static/images/profile/bg_profile.webp" mode="aspectFill"></image>
       <view class="hero-mask">
         <view class="profile-row">
-          <view class="avatar-wrap">
-            <image class="avatar-circle" src="/static/images/profile/icon_avatar.webp" mode="aspectFit"></image>
+          <view class="avatar-wrap" @tap="changeAvatar">
+            <image class="avatar-circle" :src="profile.avatar" mode="aspectFill"></image>
             <view class="camera-dot">
               <image class="camera-icon" src="/static/images/profile/ic_camera.webp" mode="aspectFit"></image>
             </view>
           </view>
           <view class="user-main">
-            <view class="name-row">
-              <text class="username">用户71499086</text>
+            <view class="name-row" @tap="editUsername">
+              <text class="username">{{ profile.username }}</text>
               <image class="edit-icon" src="/static/images/profile/ic_edit.webp" mode="aspectFit"></image>
             </view>
             <text class="subtext">欢迎来到星枢智能设备中心</text>
@@ -70,11 +70,19 @@
 import BottomTab from '../../components/BottomTab.vue'
 
 const STORAGE_KEY = 'starbase_logged_in'
+const PROFILE_KEY = 'starbase_profile'
+const THEME_KEY = 'starbase_theme'
+const DEFAULT_PROFILE = {
+  username: '用户71499086',
+  avatar: '/static/images/profile/icon_avatar.webp'
+}
 
 export default {
   components: { BottomTab },
   data() {
     return {
+      profile: { ...DEFAULT_PROFILE, ...(uni.getStorageSync(PROFILE_KEY) || {}) },
+      isDarkMode: uni.getStorageSync(THEME_KEY) === 'dark',
       settings: [
         {
           text: '账户与安全',
@@ -97,7 +105,56 @@ export default {
       ]
     }
   },
+  onShow() {
+    this.profile = { ...DEFAULT_PROFILE, ...(uni.getStorageSync(PROFILE_KEY) || {}) }
+    this.isDarkMode = uni.getStorageSync(THEME_KEY) === 'dark'
+  },
+  mounted() {
+    uni.$on('theme-change', this.handleThemeChange)
+  },
+  beforeDestroy() {
+    uni.$off('theme-change', this.handleThemeChange)
+  },
   methods: {
+    handleThemeChange(theme) {
+      this.isDarkMode = theme === 'dark'
+    },
+    saveProfile() {
+      uni.setStorageSync(PROFILE_KEY, this.profile)
+    },
+    editUsername() {
+      uni.showModal({
+        title: '修改用户名',
+        editable: true,
+        placeholderText: '请输入新的用户名',
+        content: this.profile.username,
+        success: (res) => {
+          if (!res.confirm) return
+          const username = (res.content || '').trim()
+          if (!username) {
+            uni.showToast({ title: '用户名不能为空', icon: 'none' })
+            return
+          }
+          this.profile.username = username
+          this.saveProfile()
+          uni.showToast({ title: '已保存', icon: 'none' })
+        }
+      })
+    },
+    changeAvatar() {
+      uni.chooseImage({
+        count: 1,
+        sizeType: ['compressed'],
+        sourceType: ['album', 'camera'],
+        success: (res) => {
+          const avatar = res.tempFilePaths && res.tempFilePaths[0]
+          if (!avatar) return
+          this.profile.avatar = avatar
+          this.saveProfile()
+          uni.showToast({ title: '头像已更新', icon: 'none' })
+        }
+      })
+    },
     goDevice() {
       uni.navigateTo({ url: '/pages/device/index' })
     },
@@ -124,7 +181,7 @@ export default {
 
 .hero {
   position: relative;
-  height: 358rpx;
+  height: 392rpx;
   overflow: hidden;
 }
 
@@ -192,9 +249,13 @@ export default {
 }
 
 .username {
+  max-width: 380rpx;
   font-size: 38rpx;
   font-weight: 700;
   color: #ffffff;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .edit-icon {
@@ -211,7 +272,9 @@ export default {
 }
 
 .content {
-  margin-top: -74rpx;
+  position: relative;
+  z-index: 2;
+  margin-top: -36rpx;
   padding: 0 24rpx;
 }
 
@@ -227,6 +290,9 @@ export default {
   display: flex;
   align-items: center;
   padding: 28rpx 24rpx;
+}
+.section-card {
+  min-height: 110rpx;
 }
 
 .group-card {
@@ -277,5 +343,25 @@ export default {
 
 .logout-cell .menu-title {
   color: #7a5c56;
+}
+.dark.mine-page {
+  background: #141414;
+}
+.dark .section-card,
+.dark .group-card {
+  background: #232323;
+  box-shadow: none;
+}
+.dark .menu-title {
+  color: #f2f2f2;
+}
+.dark .menu-desc {
+  color: #aaa39d;
+}
+.dark .cell.border {
+  border-bottom-color: #333333;
+}
+.dark .logout-cell .menu-title {
+  color: #e8c3bb;
 }
 </style>

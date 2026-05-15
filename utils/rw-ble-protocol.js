@@ -1,5 +1,13 @@
 const HEADER = 0xC6
-const FLAG_WRITE = 0x01
+export const FLAG_WRITE = 0x01
+export const FLAG_REPLY = 0x11
+
+export const KEY_FLAG = {
+  write: 0x00,
+  read: 0x10,
+  add: 0x20,
+  delete: 0x30
+}
 
 const CRC_TABLE = [
   0x72ae,0x2cd6,0x3d6c,0x4ae1,0x6784,0x18be,0x4823,0x0029,0x01eb,0x26e9,0x41bb,0x5af1,0x6df1,0x1649,0x5f90,0x6952,
@@ -59,6 +67,7 @@ export function parseCmdData(dataBytes) {
   return {
     cmd: dataBytes[0],
     key: dataBytes[1],
+    cmdKey: (dataBytes[0] << 8) | dataBytes[1],
     keyFlag: dataBytes[2],
     value: dataBytes.slice(3)
   }
@@ -69,35 +78,42 @@ export function cmdData(cmd, key, keyFlag, value = []) {
   arr[0] = cmd
   arr[1] = key
   arr[2] = keyFlag
-  arr.set(value, 3)
+  arr.set(value instanceof Uint8Array ? value : new Uint8Array(value), 3)
   return arr
 }
 
-export function commandLogin() { return buildPacket(cmdData(0x03, 0x02, 0x20)) }
-export function commandFindDevice(enable = true) { return buildPacket(cmdData(0x02, 0x34, 0x00, [enable ? 0x01 : 0x00])) }
-export function commandSetTimezone(tzQuarterHours) { return buildPacket(cmdData(0x02, 0x02, 0x00, [tzQuarterHours & 0xff])) }
-export function commandSetTime(date = new Date()) {
-  const y = date.getFullYear() - 2000
-  const v = [y & 0xff, date.getMonth() + 1, date.getDate(), date.getHours(), date.getMinutes(), date.getSeconds()]
-  return buildPacket(cmdData(0x02, 0x01, 0x00, v))
-}
-export function commandStartSingleTest(dataTypeLE, continuous = false) {
-  const lo = dataTypeLE & 0xff
-  const hi = (dataTypeLE >> 8) & 0xff
-  return buildPacket(cmdData(0x06, 0x09, 0x00, [lo, hi, 0x01, continuous ? 0x01 : 0x00]))
-}
-export function commandStopSingleTest(dataTypeLE) {
-  const lo = dataTypeLE & 0xff
-  const hi = (dataTypeLE >> 8) & 0xff
-  return buildPacket(cmdData(0x06, 0x09, 0x00, [lo, hi, 0x00]))
+export function command(cmd, key, keyFlag = KEY_FLAG.write, value = []) {
+  return buildPacket(cmdData(cmd, key, keyFlag, value))
 }
 
-export function commandReadHistory(dataType) {
-  return buildPacket(cmdData(0x05, dataType, 0x10))
+function float32BE(value) {
+  const buffer = new ArrayBuffer(4)
+  new DataView(buffer).setFloat32(0, Number(value) || 0, false)
+  return Array.from(new Uint8Array(buffer))
 }
 
-export function commandDeleteHistory(dataType) {
-  return buildPacket(cmdData(0x05, dataType, 0x30))
+function utf8Bytes(text) {
+  const value = String(text || '')
+  if (typeof TextEncoder !== 'undefined') return Array.from(new TextEncoder().encode(value))
+  const encoded = unescape(encodeURIComponent(value))
+  const out = []
+  for (let i = 0; i < encoded.length; i += 1) out.push(encoded.charCodeAt(i))
+  return out
+}
+
+export function signedByte(value) { return value & 0xff }
+export function u16le(value) { return [value & 0xff, (value >> 8) & 0xff] }
+export function u16be(value) { return [(value >> 8) & 0xff, value & 0xff] }
+export function u32le(value) { return [value & 0xff, (value >> 8) & 0xff, (value >> 16) & 0xff, (value >> 24) & 0xff] }
+export function u32be(value) { return [(value >> 24) & 0xff, (value >> 16) & 0xff, (value >> 8) & 0xff, value & 0xff] }
+
+export function readU16BE(bytes, offset) { return ((bytes[offset] || 0) << 8) | (bytes[offset + 1] || 0) }
+export function readU16LE(bytes, offset) { return (bytes[offset] || 0) | ((bytes[offset + 1] || 0) << 8) }
+export function readU24BE(bytes, offset) { return ((bytes[offset] || 0) << 16) | ((bytes[offset + 1] || 0) << 8) | (bytes[offset + 2] || 0) }
+export function readU32BE(bytes, offset) { return (((bytes[offset] || 0) << 24) >>> 0) + ((bytes[offset + 1] || 0) << 16) + ((bytes[offset + 2] || 0) << 8) + (bytes[offset + 3] || 0) }
+export function readI16LE(bytes, offset) {
+  const value = readU16LE(bytes, offset)
+  return value & 0x8000 ? value - 0x10000 : value
 }
 
 export const TEST_TYPES = {
@@ -112,6 +128,7 @@ export const TEST_TYPES = {
 
 export const HISTORY_TYPES = {
   todayStep: 0x1a,
+  today_step: 0x1a,
   step: 0x02,
   sleep: 0x05,
   hr: 0x03,
@@ -120,4 +137,159 @@ export const HISTORY_TYPES = {
   hrv: 0x0a,
   bloodSugar: 0x10,
   bloodPressure: 0x04
+}
+
+export const REALTIME_RESULT_KEYS = {
+  0x0224: 'hr',
+  0x0231: 'bloodPressure',
+  0x024e: 'bo',
+  0x024f: 'stress',
+  0x0269: 'hrv',
+  0x026c: 'bloodSugar'
+}
+
+export const TIMED_MONITOR_KEYS = {
+  hr: 0x16,
+  bo: 0x25,
+  hrv: 0x6a,
+  stress: 0x6b,
+  bloodSugar: 0x6e,
+  bloodPressure: 0x7c
+}
+
+export function commandLogin() { return command(0x03, 0x02, KEY_FLAG.add) }
+export function commandFindDevice(enable = true) { return command(0x02, 0x34, KEY_FLAG.write, [enable ? 1 : 0]) }
+export function commandSetTimezone(tzQuarterHours) { return command(0x02, 0x02, KEY_FLAG.write, [signedByte(tzQuarterHours)]) }
+export function commandSetTime(date = new Date()) {
+  return command(0x02, 0x01, KEY_FLAG.write, [date.getFullYear() - 2000, date.getMonth() + 1, date.getDate(), date.getHours(), date.getMinutes(), date.getSeconds()])
+}
+export function commandGetFirmware() { return command(0x02, 0x04, KEY_FLAG.read) }
+export function commandGetPower() { return command(0x02, 0x03, KEY_FLAG.read) }
+export function commandGetMac() { return command(0x02, 0x05, KEY_FLAG.read) }
+export function commandGetRestingHealth() { return command(0x02, 0x81, KEY_FLAG.read) }
+export function commandSetUserInfo({ measureUnit = 0, gender = 1, age = 20, height = 170, weight = 60 } = {}) {
+  return command(0x02, 0x06, KEY_FLAG.write, [measureUnit, gender, age, ...float32BE(height), ...float32BE(weight)])
+}
+export function commandTimedMonitor(type, enabled, duration = 60, read = false) {
+  const key = TIMED_MONITOR_KEYS[type]
+  if (!key) throw new Error(`unsupported timed monitor: ${type}`)
+  if (read) return command(0x02, key, KEY_FLAG.read)
+  return command(0x02, key, KEY_FLAG.write, [enabled ? 1 : 0, 0, 0, 23, 59, type === 'hr' ? duration : 60])
+}
+export function commandSetLedLevel(enabled, level = 3, read = false) {
+  return command(0x02, 0x66, read ? KEY_FLAG.read : KEY_FLAG.write, read ? [] : [enabled ? 1 : 0, level])
+}
+export function commandSetVideoHid(enabled, type = 1, read = false) {
+  return command(0x02, 0x64, read ? KEY_FLAG.read : KEY_FLAG.write, read ? [] : [enabled ? type : 0, enabled ? 1 : 0])
+}
+export function commandSetWearHand(rightHand, read = false) {
+  return command(0x02, 0x68, read ? KEY_FLAG.read : KEY_FLAG.write, read ? [] : [rightHand ? 1 : 0])
+}
+export function commandSetBleName(name) {
+  const bytes = utf8Bytes(name).slice(0, 24)
+  return command(0x02, 0x65, KEY_FLAG.write, [bytes.length, ...bytes])
+}
+export function commandStartSingleTest(dataTypeLE, continuous = false) {
+  return command(0x06, 0x09, KEY_FLAG.write, [...u16le(dataTypeLE), 1, continuous ? 1 : 0])
+}
+export function commandStopSingleTest(dataTypeLE) {
+  return command(0x06, 0x09, KEY_FLAG.write, [...u16le(dataTypeLE), 0])
+}
+export function commandControlPhoto(type = 1) { return command(0x06, 0x01, KEY_FLAG.write, [type]) }
+export function commandPowerOff(type = 1) { return command(0x02, 0x22, KEY_FLAG.write, [type]) }
+export function commandGenericWrite(cmd, key, value = []) { return command(cmd, key, KEY_FLAG.write, value) }
+export function commandReadHistory(dataType) { return command(0x05, dataType, KEY_FLAG.read) }
+export function commandDeleteHistory(dataType) { return command(0x05, dataType, KEY_FLAG.delete) }
+export function commandSensorOutput(sensorType, enabled = true) { return command(0x02, 0xfa, KEY_FLAG.write, [enabled ? 1 : 2, sensorType]) }
+
+export function parseFirmwareValue(value) {
+  if (!value || value.length < 9) return null
+  const modelBytes = value.slice(8, 16)
+  return {
+    firmwareVersion: `${value[0]}.${value[1]}.${value[2]}`,
+    shape: value[3] === 1 ? 'round' : 'square',
+    width: readU16BE(value, 4),
+    height: readU16BE(value, 6),
+    model: Array.from(modelBytes).filter(Boolean).map((b) => String.fromCharCode(b)).join('')
+  }
+}
+
+export function protocolTimestamp(secondsFrom2000) {
+  return (Number(secondsFrom2000) + 946684800) * 1000
+}
+
+function parseSeries(value, size, parser) {
+  const out = []
+  for (let i = 0; i + size <= value.length; i += size) out.push(parser(value, i))
+  return out
+}
+
+export function parseHistoryItems(type, value) {
+  if (!value || !value.length) return []
+  if (type === 'step' || type === 'todayStep' || type === 'today_step') {
+    return parseSeries(value, 16, (b, i) => ({ time: protocolTimestamp(readU32BE(b, i)), mode: b[i + 4], steps: readU24BE(b, i + 5), calories: readU32BE(b, i + 8) / 10, distance: readU32BE(b, i + 12) / 10000 }))
+  }
+  if (type === 'sleep') {
+    return parseSeries(value, 7, (b, i) => ({ time: protocolTimestamp(readU32BE(b, i)), status: b[i + 4], reserved1: b[i + 5], reserved2: b[i + 6] }))
+  }
+  if (type === 'bloodSugar') {
+    return parseSeries(value, 6, (b, i) => ({ time: protocolTimestamp(readU32BE(b, i)), value: (readU16BE(b, i + 4) / 10).toFixed(1) }))
+  }
+  if (type === 'bloodPressure') {
+    return parseSeries(value, 6, (b, i) => ({ time: protocolTimestamp(readU32BE(b, i)), systolic: b[i + 4], diastolic: b[i + 5] }))
+  }
+  return parseSeries(value, 6, (b, i) => ({ time: protocolTimestamp(readU32BE(b, i)), value: b[i + 4] }))
+}
+
+export function parseRealtimeValue(cmdKey, value) {
+  const type = REALTIME_RESULT_KEYS[cmdKey]
+  if (!type || !value || value.length < 6) return null
+  if (type === 'bloodSugar') return { type, value: (readU16BE(value, 4) / 10).toFixed(1), time: protocolTimestamp(readU32BE(value, 0)) }
+  if (type === 'bloodPressure') return { type, systolic: value[4], diastolic: value[5], time: protocolTimestamp(readU32BE(value, 0)) }
+  return { type, value: value[4], time: protocolTimestamp(readU32BE(value, 0)) }
+}
+
+export function parseTouchEvent(value) {
+  if (!value || value.length < 2) return null
+  return { buttonType: value[0], touchType: value[1] }
+}
+
+export function parseRestingHealth(value) {
+  if (!value || value.length < 3) return null
+  return { restingHr: value[0], restingHrv: value[1], restingBo: value[2] }
+}
+
+export function parseMac(value) {
+  if (!value || value.length < 6) return ''
+  return Array.from(value.slice(0, 6)).reverse().map((b) => b.toString(16).padStart(2, '0').toUpperCase()).join(':')
+}
+
+export function parseSensorPacket(cmdDataValue) {
+  const value = cmdDataValue || []
+  if (value.length < 1) return null
+  const sensorType = value[0]
+  if (sensorType === 1) {
+    const acc = []
+    for (let i = 1; i + 5 < value.length; i += 6) acc.push({ x: readI16LE(value, i), y: readI16LE(value, i + 2), z: readI16LE(value, i + 4) })
+    return { sensorType, acc }
+  }
+  const dataType = value[1]
+  const payload = value.slice(2)
+  if (dataType === 0 && payload.length >= 4) return { sensorType, dataType, timestamp: readU32BE(payload, 0) }
+  const samples = []
+  for (let i = 0; i + 3 < payload.length; i += 4) samples.push(readU32BE(payload, i))
+  return { sensorType, dataType, samples }
+}
+
+export function otaFileCrc(bytes) {
+  let crc = 0
+  for (let i = 0; i < bytes.length; i += 1) crc = (crc + bytes[i]) & 0xffff
+  return crc
+}
+
+export const OTA = {
+  init(fileLength) { return new Uint8Array([0x27, ...u32le(fileLength)]).buffer },
+  create(offset, size) { return new Uint8Array([0x25, ...u32le(offset), ...u32le(size)]).buffer },
+  upgrade(fileLength, crc) { return new Uint8Array([0x18, ...u32le(fileLength), ...u16le(crc)]).buffer },
+  reset() { return new Uint8Array([0x22, 0x00]).buffer }
 }
